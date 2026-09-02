@@ -1,0 +1,35 @@
+# Secrets must never enter the build context. Anything in the context can be
+# pulled in by a COPY (including a broad `COPY . .` added later), and a
+# secret baked into a layer stays there even if a later layer deletes it.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Python build/test artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Tests aren't needed at runtime and only enlarge the image
+tests/
+
+# VCS / editor / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+.DS_Store

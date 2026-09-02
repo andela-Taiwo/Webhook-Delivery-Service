@@ -1,0 +1,140 @@
+name: webhook-delivery-service
+
+# Host port bindings are configurable so the stack doesn't collide with a
+# Postgres/Redis/Kafka already running on the developer's machine. Container
+# ports are unchanged, so service-to-service URLs stay the same either way.
+# Override in .env or inline, e.g.: POSTGRES_HOST_PORT=55432 docker compose up
+
+services:
+  backend:
+    build:
+      context: ./backend
+      target: runtime
+    ports:
+      - "${BACKEND_HOST_PORT:-8000}:8000"
+    environment:
+      WEBHOOK_ENVIRONMENT: local
+      WEBHOOK_LOG_JSON: "true"
+      WEBHOOK_OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      WEBHOOK_DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhook-delivery
+      WEBHOOK_REDIS_URL: redis://redis:6379/0
+      WEBHOOK_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  # Migrations run to completion before the backend starts, mirroring how a
+  # deployment applies them ahead of the rollout. Keeping this a separate
+  # one-shot service (rather than an entrypoint hook) means N backend
+  # replicas don't race to migrate the same database on startup.
+  migrate:
+    build:
+      context: ./backend
+      target: runtime
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      WEBHOOK_ENVIRONMENT: local
+      WEBHOOK_OTEL_ENABLED: "false"
+      WEBHOOK_DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhook-delivery
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: webhook
+      POSTGRES_PASSWORD: webhook
+      POSTGRES_DB: webhook-delivery
+    ports:
+      - "${POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webhook -d webhook-delivery"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_HOST_PORT:-56379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Single-node Kafka in KRaft mode — no ZooKeeper needed.
+  kafka:
+    image: apache/kafka:3.8.0
+    ports:
+      - "${KAFKA_HOST_PORT:-59092}:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Two PLAINTEXT listeners because a Kafka client is redirected to
+      # whatever the broker advertises: in-network clients must be sent to
+      # `kafka:9092`, while a client on the host can only reach
+      # `localhost:<published port>`. One listener cannot satisfy both.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:19092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-59092}
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --- Observability stack ---
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.112.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./deploy/observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./deploy/observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - jaeger
+
+volumes:
+  postgres-data:
