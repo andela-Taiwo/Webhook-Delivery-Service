@@ -132,7 +132,8 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.28.0
+        # Note the `v` prefix: this action's tags are `v0.36.0`, not `0.36.0`.
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: webhook-backend:ci
           format: table
