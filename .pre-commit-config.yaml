@@ -1,0 +1,52 @@
+# Fast local mirror of the CI gates. Install once with:
+#   uv tool install pre-commit && pre-commit install
+#
+# Deliberately excludes the test suite: testcontainers-backed tests take too
+# long for a commit hook, and a hook people routinely skip with --no-verify
+# enforces nothing. CI runs the full suite.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      # Catches an accidentally committed private key outright.
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^backend/
+      - id: ruff-format
+        files: ^backend/
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.23.3
+    hooks:
+      # The single most valuable hook here: a secret caught pre-commit costs
+      # nothing, while one that reaches the remote must be treated as
+      # compromised and rotated even after it's deleted.
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy --strict
+        entry: bash -c 'cd backend && uv run mypy src'
+        language: system
+        types: [python]
+        files: ^backend/src/
+        pass_filenames: false
+
+      - id: no-env-file
+        name: refuse to commit a .env file
+        entry: bash -c 'echo "ERROR: .env holds real secrets and must never be committed (see .env.example)"; exit 1'
+        language: system
+        files: (^|/)\.env$

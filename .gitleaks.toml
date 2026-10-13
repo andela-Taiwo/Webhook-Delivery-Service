@@ -1,0 +1,36 @@
+# Gitleaks configuration.
+#
+# Extends the default ruleset (AWS keys, GitHub tokens, private keys, generic
+# high-entropy strings) rather than replacing it — the defaults are broad and
+# well maintained, and narrowing them is how real leaks get missed.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "webhook-signing-secret"
+description = "Webhook signing secret or API key pepper with a real-looking value"
+# Matches an assignment only when the value has substance; empty placeholders
+# in .env.example are intentionally not a finding.
+regex = '''(?i)(WEBHOOK_SIGNING_SECRET_ENCRYPTION_KEY|WEBHOOK_API_KEY_PEPPER)\s*[:=]\s*['"]?[A-Za-z0-9+/=_-]{16,}['"]?'''
+tags = ["secret", "webhook-service"]
+
+[allowlist]
+description = "Known-safe paths and development-only credentials"
+
+paths = [
+  # Placeholder values only, by design.
+  '''backend/\.env\.example$''',
+  # Lock files contain hashes, not secrets; they trip entropy heuristics.
+  '''uv\.lock$''',
+  '''package-lock\.json$''',
+]
+
+regexes = [
+  # Throwaway local-only Postgres credentials in the compose stack. These are
+  # matched by the app's own startup validation, which refuses to boot a
+  # staging/production process using them — so they cannot reach a real
+  # environment even if someone copies the compose file.
+  '''postgresql\+asyncpg://webhook:webhook@''',
+  '''POSTGRES_PASSWORD:\s*webhook''',
+]

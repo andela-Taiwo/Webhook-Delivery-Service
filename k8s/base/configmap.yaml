@@ -1,0 +1,16 @@
+# Non-secret config only. DB/Redis/Kafka credentials belong in a Secret
+# (`webhook-backend-secrets`, created out-of-band via your secrets manager —
+# see k8s/README.md) and merged in via envFrom in deployment.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-backend-config
+  namespace: webhook-service
+data:
+  WEBHOOK_ENVIRONMENT: "production"
+  WEBHOOK_LOG_JSON: "true"
+  WEBHOOK_LOG_LEVEL: "INFO"
+  WEBHOOK_OTEL_ENABLED: "true"
+  WEBHOOK_OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4317"
+  WEBHOOK_OTEL_TRACES_SAMPLE_RATIO: "0.1"
+  WEBHOOK_METRICS_ENABLED: "true"

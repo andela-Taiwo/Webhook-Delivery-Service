@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # Secret scanning runs first and independently: if a credential was
+  # committed, that matters regardless of whether the tests pass.
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the scan covers the whole branch, not just the tip
+          # — a secret added and then "removed" in a later commit is still in
+          # the history and still compromised.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv sync --group dev
+
+      - name: ruff (lint)
+        run: uv run ruff check src tests
+
+      - name: ruff (format)
+        run: uv run ruff format --check src tests
+
+      - name: mypy --strict
+        run: uv run mypy src
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv sync --group dev
+
+      - name: pytest
+        # Docker is present on GitHub-hosted runners, so testcontainers-backed
+        # tests must actually run. WEBHOOK_REQUIRE_DOCKER turns a missing
+        # daemon into a failure rather than a silent skip of exactly the
+        # tests that exercise real infrastructure.
+        env:
+          WEBHOOK_REQUIRE_DOCKER: "1"
+        run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: backend/coverage.xml
+          if-no-files-found: warn
+
+  dependencies:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv sync --group dev
+
+      - name: pip-audit
+        run: uvx pip-audit --strict
+
+  image:
+    name: Build and scan image
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: runtime
+          push: false
+          load: true
+          tags: webhook-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy vulnerability scan
+        # Note the `v` prefix: this action's tags are `v0.36.0`, not `0.36.0`.
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: webhook-backend:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+      - name: Assert the image contains no baked secrets
+        # Defence in depth behind the gitleaks job: that scans the repo, this
+        # scans what actually ships. A secret introduced by a build argument
+        # or a stray COPY would pass the source scan and fail here.
+        run: |
+          docker run --rm --entrypoint sh webhook-backend:ci -c '
+            for f in /app/.env /app/.env.local /app/.env.production; do
+              if [ -f "$f" ]; then echo "FAIL: $f is baked into the image"; exit 1; fi
+            done
+            if env | grep -Eiq "secret|pepper|password|token"; then
+              echo "FAIL: secret-looking variable baked into the image environment"
+              exit 1
+            fi
+            echo "OK: no secrets in image"
+          '
+
+      - name: Smoke-test the image
+        # The image built and scanned clean once while still being unable to
+        # start (the venv had dependencies but not the project itself, so
+        # uvicorn died on ModuleNotFoundError). Building is not evidence of
+        # running, so CI starts the container and drives a real request.
+        run: |
+          docker run -d --name smoke -p 8000:8000 \
+            -e WEBHOOK_OTEL_ENABLED=false webhook-backend:ci
+
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:8000/healthz >/dev/null && break
+            sleep 1
+          done
+
+          if ! curl -sf http://localhost:8000/healthz; then
+            echo "FAIL: container never served /healthz"
+            docker logs smoke
+            docker rm -f smoke
+            exit 1
+          fi
+
+          # 503 is correct here — no Postgres/Redis/Kafka is linked. What is
+          # being asserted is that the route exists and reports dependency
+          # state rather than 404ing or crashing the process.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/readyz)
+          docker rm -f smoke
+          if [ "$code" != "503" ] && [ "$code" != "200" ]; then
+            echo "FAIL: /readyz returned $code"
+            exit 1
+          fi
+          echo "OK: image starts and serves probes"
